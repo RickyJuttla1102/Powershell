@@ -1,0 +1,138 @@
+#Get the list of databases to restore
+$SqlServer="grpweudevmsql01.luxbourse.local"
+$Username="LocalSqlAdm"
+$Pwd="Xuldu2022!.."
+#$Pwd = read-host -AsSecureString -Prompt "Password"
+$Path="C:\ProdRestoreFilesList"
+
+$Database = Invoke-SqlCmd -ServerInstance $SqlServer -Username $Username -Password $Pwd -Database master -Query "select name from master.sys.databases where database_id>4 and [name] in ('REFE')"
+
+
+#Install-Module -Name Az -Force 
+$AzureStorageAccount='fsqsqlbackupprd'
+$RestoreDateTime='03/15/2024 15:15:00'
+$StorageContainer='https://fsqsqlbackupprd.blob.core.windows.net/sqlbackup/'
+$ResourceGroup='grp-weu-prd-rgp-msql-01'
+
+Connect-AzAccount
+
+#Sets the tenant, subscription, and environment for cmdlets to use in the current session.
+Set-AzContext -subscription 'Enterprise Production Subscription'
+
+#Gets specific storage account
+$aSA = Get-AzStorageAccount -Name $AzureStorageAccount -ResourceGroupName $ResourceGroup
+$Container = Get-AzStorageContainer -Context $aSA.Context -Name 'sqlbackup'
+
+
+function CreateFolderStructure 
+{
+    param([string]$Path)
+
+    # create folder for database scripts
+    if ( !(Test-Path "$Path\$DatabaseName"))
+        {$null=new-item -type directory -Name "$DatabaseName" -path "$Path\"}  
+}
+
+
+$Query="declare @SQLStmt Nvarchar(200)
+
+declare db_cursor cursor FOR
+
+select 'ALTER USER [' + udp.[name] + '] WITH LOGIN = [' + udp.[name]+']'
+from sys.database_principals udp
+inner join  master.sys.server_principals msp 
+on udp.[name] COLLATE French_CI_AS = msp.[name] COLLATE French_CI_AS
+and udp.[type] COLLATE French_CI_AS = msp.[type] COLLATE French_CI_AS
+and udp.[name] not in ('dbo','quest','INFORMATION_SCHEMA','sys')
+and udp.[type] = 'S'
+
+open db_cursor
+fetch next from db_cursor into @SQLStmt
+
+while @@fetch_status = 0
+begin
+	exec sp_executesql @SQLStmt
+	fetch next from db_cursor into @SQLStmt
+end
+close db_cursor
+deallocate db_cursor"
+
+##Set-DbaDbState -SqlInstance $SqlServer -Database Quartz,FWCM,FWDL -MultiUser -Force
+
+$Database | ForEach-Object{
+             $DatabaseName = $_.name
+
+
+              CreateFolderStructure -Path $Path      
+
+                    $BlobRaw = Get-AzStorageBlob -Container $Container.Name -Context $aSA.Context | where {$_.Name -like "*$DatabaseName*" } 
+
+                    $Full=$BlobRaw  | where {$_.name -like '*/FULL/*' } 
+                    $Diff=$BlobRaw  | where {$_.name -like '*/DIFF/*' }
+                    $TLog=$BlobRaw  | where {$_.name -like '*/LOG/*' }
+
+                    $LatestFull=$Full | where {$_.LastModified -lt $RestoreDateTime}  | sort-object LastModified -Descending| Select-Object -First 1
+                    $LatestDiff=$Diff | where {$_.LastModified -lt $RestoreDateTime -and $_.LastModified -gt $LatestFull.LastModified}  | sort-object LastModified -Descending| Select-Object -First 1
+                    $LatestTLog=$TLog | where {$_.LastModified -lt $RestoreDateTime -and $_.LastModified -gt $LatestDiff.LastModified}
+                    $MaxTLog=$LatestTLog | sort-object LastModified -Descending | Select-Object -First 1 #9th
+                    $FinalTLog=$TLog| where {$_.LastModified -gt $MaxTLog.LastModified }| sort-object LastModified |Select-Object -First 2
+
+                    #Required TLogs we need are LatestTlog and FinalTlog
+                    #$LatestTLog > 
+
+
+                    $StorageContainer+$LatestFull.Name > $Path\$DatabaseName\$DatabaseName.txt
+                    #check if Diff backup exist, as on SUnday's only full is done.
+                    if ($LatestDiff.Name -ne $null ){
+                        $StorageContainer+$LatestDiff.Name >> $Path\$DatabaseName\$DatabaseName.txt
+                    }
+
+                    #Blobs ready should be LatestFull + LatestDiff and required TLogs.   Trick is how to get them into one list, NOT STRINGS joint
+
+                    foreach ($TFile in $LatestTLog)
+                    {
+                        $StorageContainer+$TFile.Name >> $Path\$DatabaseName\$DatabaseName.txt
+                    }
+                    
+                    foreach ($TFile in $FinalTLog)
+                    {
+                        $StorageContainer+$TFile.Name >> $Path\$DatabaseName\$DatabaseName.txt
+                    }
+
+  }
+                    ##Restore
+
+                    $File = Get-Content $Path\$DatabaseName\$DatabaseName.txt
+                    $NewDB=$DatabaseName    ###+"_Prod"
+                    Write-Host $NewDB
+                    Write-Host "1. About to restore"
+
+                    $File | `
+                    Restore-DBADatabase -SQLInstance $SqlServer `
+                    -DatabaseName $NewDB -WithReplace -NoRecovery 
+
+#
+                    #$File | `
+                    #Restore-DBADatabase -SQLInstance $SqlServer `
+                    #-DatabaseName $NewDB -ReplaceDbNameInFile `
+                    #-DestinationDataDirectory K:\Data `
+                    #-DestinationLogDirectory J:\log `
+                    #-NoRecovery
+
+Write-Host "2. About to restore"
+                     
+                    Restore-DbaDatabase -SqlInstance $SqlServer -DatabaseName $NewDB -Recover
+                    Write-Host "3"
+                    
+                    Invoke-Sqlcmd -ServerInstance $SqlServer -Username $Username -Password $Pwd -Database $NewDB -Query $Query
+ Write-Host "4"
+
+#}
+
+<#
+Quartz
+1. About to restore
+WARNING: SQLPS or SqlServer was previously imported during this session. If you encounter weird issues with dbatools, please restart PowerShell, then import dbatools without loading SQLPS or SqlServer 
+first.
+WARNING: To disable this message, type: Set-DbatoolsConfig -Name Import.SqlpsCheck -Value $false -PassThru | Register-DbatoolsConfig
+#>
