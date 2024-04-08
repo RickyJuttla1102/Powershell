@@ -1,4 +1,4 @@
-#Author Ricky Juttla
+#Author: Ricky Juttla
 function Log-Message()
 {
     param

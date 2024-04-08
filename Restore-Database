@@ -1,3 +1,5 @@
+#author :  Ricky Juttla
+
 #Get the list of databases to restore
 $SqlServer="grpweudevmsql01.luxbourse.local"
 $Username="LocalSqlAdm"
